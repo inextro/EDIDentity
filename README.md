@@ -12,7 +12,7 @@ Swapping them back with a tool like `displayplacer` fixes the picture but change
 
 EDIDentity reads each external display's EDID, finds the target by its alphanumeric serial, and applies a copy of that EDID with a different numeric serial (checksum fixed). macOS then sees two distinct monitors and remembers their positions itself, so nothing ever needs swapping.
 
-The override uses `IOAVServiceSetVirtualEDIDMode`, a private IOKit function on Apple Silicon. It is **volatile**: nothing is written to the monitor, and the factory EDID comes back on reconnect or reboot. `edidentity watch` runs as a LaunchAgent and re-applies the override whenever the display reconnects.
+The override uses `IOAVServiceSetVirtualEDIDMode`, a private IOKit function on Apple Silicon. It is **volatile**: nothing is written to the monitor, and the factory EDID comes back on reconnect, sleep and reboot. `edidentity watch` runs as a LaunchAgent and re-applies the override whenever that happens. It waits until the display configuration has been quiet for a few seconds, because changing a display's identity while macOS is still waking up can leave it without a Space (windows show, but no wallpaper or menu bar). If that still happens, `watch` notices, restores the factory EDID and applies the override again.
 
 ## Requirements
 
@@ -64,6 +64,8 @@ edidentity reset --target H4UR201985   # optional, reconnecting also restores it
 
 - Private API: a macOS update may change or remove it.
 - `watch` applies at most 3 times in 2 minutes, so a display that rejects the override cannot flicker in a loop.
+- Each re-apply looks like a reconnect to macOS, so the target display gets a fresh Space after wake. Windows that were on it may move to the other display.
+- `edidentity list` also reports displays that have no Space.
 - Only the numeric serial changes. Modes, resolution and color are untouched.
 
 ## License

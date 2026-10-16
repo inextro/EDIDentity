@@ -1,9 +1,14 @@
 // EDIDentity: give one of two identical monitors a distinct EDID serial so macOS can tell them apart.
 // Apple Silicon only. The EDID is applied as a volatile override through IOAVServiceSetVirtualEDIDMode,
-// so nothing is written to the monitor. The override is lost on reconnect; `watch` re-applies it.
-import Foundation
+// so nothing is written to the monitor. The override is lost on reconnect and on wake; `watch` re-applies it.
+import AppKit
 import IOKit
 import CoreGraphics
+
+@_silgen_name("CGSMainConnectionID")
+func CGSMainConnectionID() -> Int32
+@_silgen_name("CGSCopyManagedDisplaySpaces")
+func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> Unmanaged<CFArray>?
 
 @_silgen_name("IOAVServiceCreateWithService")
 func IOAVServiceCreateWithService(_ alloc: CFAllocator?, _ service: io_service_t) -> Unmanaged<CFTypeRef>?
@@ -102,25 +107,65 @@ func apply(_ d: Display, serial: UInt32) -> IOReturn {
 
 func hex(_ r: IOReturn) -> String { "0x" + String(UInt32(bitPattern: r), radix: 16) }
 
-// Watch mode: apply when the target is connected with a different serial, but never more than
-// 3 times in 2 minutes so a display that rejects the override cannot cause a flicker loop.
+// Online displays that the Dock has not given a Space. Such a display shows windows but no
+// wallpaper or menu bar; it happens when the identity changes while macOS is still waking up.
+func displaysWithoutSpaces() -> [String] {
+    let managed = CGSCopyManagedDisplaySpaces(CGSMainConnectionID())?.takeRetainedValue() as? [[String: Any]] ?? []
+    let withSpaces = Set(managed.compactMap { m -> String? in
+        guard let spaces = m["Spaces"] as? [Any], !spaces.isEmpty else { return nil }
+        return m["Display Identifier"] as? String
+    })
+    // With "Displays have separate Spaces" off, the Dock reports one entry for all displays.
+    if withSpaces.contains("Main") && managed.count == 1 { return [] }
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16); var n: UInt32 = 0
+    CGGetOnlineDisplayList(16, &ids, &n)
+    return ids.prefix(Int(n)).compactMap { id in
+        guard let u = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
+        let s = CFUUIDCreateString(nil, u) as String
+        return withSpaces.contains(s) || (CGDisplayIsMain(id) != 0 && withSpaces.contains("Main")) ? nil : s
+    }
+}
+
+// Watch mode: apply when the target is connected with a different serial, once the display
+// configuration has been quiet for `settle` seconds. The quiet period counts from the last change,
+// not from wake, so it only adds `settle` on top of however long macOS takes to bring displays back.
+// Never more than 3 times in 2 minutes, so a display that rejects the override cannot cause a flicker loop.
+let settle: TimeInterval = 1.5
+var lastChange = Date.distantPast
+var burstStart: Date?
+var burstEvents = 0
 var recentApplies: [Date] = []
-func check(_ alnum: String, _ serial: UInt32) {
-    guard let d = findTarget(alnum), d.serial != serial else { return }
+var watchTarget = ""
+var watchSerial: UInt32 = 0
+
+func check() {
+    guard Date().timeIntervalSince(lastChange) >= settle else { return }
+    // Log how long the last burst of display changes took, to tune `settle` from real wakes.
+    let burst = burstStart.map { String(format: " (after %d changes over %.1fs)", burstEvents, lastChange.timeIntervalSince($0)) } ?? ""
+    burstStart = nil; burstEvents = 0
+    guard let d = findTarget(watchTarget), d.serial != watchSerial else { return }
     recentApplies = recentApplies.filter { Date().timeIntervalSince($0) < 120 }
     guard recentApplies.count < 3 else { log("skip: applied 3 times in 2 minutes"); return }
     recentApplies.append(Date())
-    log("apply \(alnum): serial \(d.serial) -> \(serial): \(hex(apply(d, serial: serial)))")
+    log("apply \(watchTarget): serial \(d.serial) -> \(watchSerial): \(hex(apply(d, serial: watchSerial)))\(burst)")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { verify(retry: true) }
 }
 
-var pending = false
-var watchTarget = ""
-var watchSerial: UInt32 = 0
-func schedule() {
-    guard !pending else { return }
-    pending = true
-    // Give the AV service a moment to come up after reconfiguration.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { pending = false; check(watchTarget, watchSerial) }
+// If the Dock missed the new display, restore the factory EDID; check() re-applies it after the
+// configuration settles again, which the Dock then picks up as a normal connect.
+func verify(retry: Bool) {
+    let missing = displaysWithoutSpaces()
+    guard !missing.isEmpty else { return }
+    log("display without Spaces: \(missing.joined(separator: ", "))")
+    guard retry, let d = findTarget(watchTarget) else { return }
+    log("reset \(watchTarget) to retry: \(hex(IOAVServiceSetVirtualEDIDMode(d.service, nil, nil)))")
+}
+
+func changed() {
+    lastChange = Date()
+    if burstStart == nil { burstStart = lastChange }
+    burstEvents += 1
+    DispatchQueue.main.asyncAfter(deadline: .now() + settle + 0.1) { check() }
 }
 
 // MARK: - CLI
@@ -153,6 +198,8 @@ case "list":
     for d in externalDisplays() {
         print("\(d.name ?? "?")  alphanumeric=\(d.alnum ?? "-")  serial=\(d.serial)")
     }
+    let missing = displaysWithoutSpaces()
+    if !missing.isEmpty { print("displays without Spaces (no wallpaper/menu bar): \(missing.joined(separator: ", "))") }
 
 case "apply":
     let t = requireTarget()
@@ -169,14 +216,21 @@ case "watch":
     watchTarget = requireTarget()
     watchSerial = serialArg ?? derivedSerial(watchTarget)
     log("watch \(watchTarget) -> serial \(watchSerial)")
-    _ = CGMainDisplayID()   // connect to WindowServer so reconfiguration callbacks arrive
-    CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
-        if !flags.contains(.beginConfigurationFlag) { DispatchQueue.main.async { schedule() } }
+    // A background NSApplication keeps a WindowServer connection whose events deliver the
+    // reconfiguration callbacks; a bare run loop does not get them.
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    CGDisplayRegisterReconfigurationCallback({ _, _, _ in
+        DispatchQueue.main.async { changed() }
     }, nil)
+    // Displays come back one by one after wake; treat wake itself as a change so we wait it out.
+    NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in changed() }
+    NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { _ in changed() }
     // Fallback in case a callback is missed; it is only an IORegistry lookup.
-    Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in check(watchTarget, watchSerial) }
-    check(watchTarget, watchSerial)
-    RunLoop.main.run()
+    Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in check() }
+    check()
+    NSApplication.shared.run()
 
 default:
     print(usage)
