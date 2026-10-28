@@ -1,8 +1,9 @@
 #!/bin/zsh
 # Build, install to ~/.local/bin, and register a LaunchAgent that runs `edidentity watch` at login.
-# usage: scripts/install.sh <alphanumeric serial> [numeric serial]
+# usage: scripts/install.sh <alphanumeric serial> [numeric serial] [--order <serial>,<serial>]
 set -e
-[[ -n "$1" ]] || { echo "usage: $0 <alphanumeric serial> [numeric serial]"; echo "find it with: edidentity list"; exit 1 }
+zparseopts -D -E -order:=order
+[[ -n "$1" ]] || { echo "usage: $0 <alphanumeric serial> [numeric serial] [--order <serial>,<serial>]"; echo "find it with: edidentity list"; exit 1 }
 cd "${0:A:h}/.."
 
 mkdir -p build ~/.local/bin ~/Library/LaunchAgents ~/Library/Logs
@@ -13,6 +14,8 @@ label=com.inextro.edidentity
 plist=~/Library/LaunchAgents/$label.plist
 serial_args=""
 [[ -n "$2" ]] && serial_args="<string>--serial</string><string>$2</string>"
+order_args=""
+[[ -n "$order" ]] && order_args="<string>--order</string><string>${order[2]}</string>"
 cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -25,6 +28,7 @@ cat > "$plist" <<EOF
         <string>watch</string>
         <string>--target</string><string>$1</string>
         $serial_args
+        $order_args
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>

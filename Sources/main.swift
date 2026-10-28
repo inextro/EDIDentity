@@ -22,12 +22,15 @@ let usage = """
 usage: edidentity list
        edidentity apply --target <alphanumeric serial> [--serial <n>]
        edidentity reset --target <alphanumeric serial>
-       edidentity watch --target <alphanumeric serial> [--serial <n>]
+       edidentity arrange --order <alphanumeric serial>,<alphanumeric serial>[,...]
+       edidentity watch --target <alphanumeric serial> [--serial <n>] [--order <serials>]
 
   list    show external displays with their EDID serials
   apply   override the target display's numeric serial once
   reset   restore the target display's factory EDID
-  watch   stay running and re-apply whenever displays are reconnected
+  arrange place the listed displays side by side, left to right, once
+  watch   stay running and re-apply whenever displays are reconnected;
+          with --order, also put the displays back in that order whenever macOS swaps them
 
   --serial defaults to a value derived from the alphanumeric serial.
 """
@@ -107,6 +110,45 @@ func apply(_ d: Display, serial: UInt32) -> IOReturn {
 
 func hex(_ r: IOReturn) -> String { "0x" + String(UInt32(bitPattern: r), radix: 16) }
 
+// The CoreGraphics display showing `d`, matched by numeric serial. Nil unless exactly one matches,
+// which with two identical monitors needs the override to be active.
+func cgDisplay(_ d: Display) -> CGDirectDisplayID? {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16); var n: UInt32 = 0
+    CGGetActiveDisplayList(16, &ids, &n)
+    let m = ids.prefix(Int(n)).filter { CGDisplaySerialNumber($0) == d.serial }
+    return m.count == 1 ? m[0] : nil
+}
+
+// New origins that put the displays in `order` side by side, left to right, in the slots they
+// occupy now. Nil when they already are in order, or when one is missing or cannot be told apart.
+// macOS can still swap the monitors with the override active: after a reboot it restores the
+// arrangement it worked out before the override was applied.
+func arrangement(_ order: [String]) -> [(CGDirectDisplayID, CGPoint)]? {
+    let all = externalDisplays()
+    let ids = order.compactMap { a in all.first { $0.alnum == a }.flatMap(cgDisplay) }
+    guard ids.count == order.count, Set(ids).count == ids.count else { return nil }
+    let xs = ids.map { CGDisplayBounds($0).minX }
+    guard zip(xs, xs.dropFirst()).contains(where: { $0 >= $1 }) else { return nil }
+    let slots = ids.map(CGDisplayBounds).sorted { $0.minX < $1.minX }
+    var x = slots[0].minX
+    return zip(ids, slots).map { id, slot in
+        defer { x += CGDisplayBounds(id).width }
+        return (id, CGPoint(x: x, y: slot.minY))
+    }
+}
+
+// Moving a display to the main slot makes it main, so Spaces may need cleaning up afterwards.
+func arrange(_ moves: [(CGDirectDisplayID, CGPoint)]) -> CGError {
+    var cfg: CGDisplayConfigRef?
+    CGBeginDisplayConfiguration(&cfg)
+    for (id, p) in moves { CGConfigureDisplayOrigin(cfg, id, Int32(p.x), Int32(p.y)) }
+    return CGCompleteDisplayConfiguration(cfg, .permanently)
+}
+
+func describe(_ moves: [(CGDirectDisplayID, CGPoint)]) -> String {
+    moves.map { "\($0.0)@(\(Int($0.1.x)),\(Int($0.1.y)))" }.joined(separator: " ")
+}
+
 // Online displays that the Dock has not given a Space. Such a display shows windows but no
 // wallpaper or menu bar; it happens when the identity changes while macOS is still waking up.
 func displaysWithoutSpaces() -> [String] {
@@ -135,20 +177,32 @@ var lastChange = Date.distantPast
 var burstStart: Date?
 var burstEvents = 0
 var recentApplies: [Date] = []
+var recentArranges: [Date] = []
 var watchTarget = ""
 var watchSerial: UInt32 = 0
+var watchOrder: [String] = []
 
 func check() {
     guard Date().timeIntervalSince(lastChange) >= settle else { return }
     // Log how long the last burst of display changes took, to tune `settle` from real wakes.
     let burst = burstStart.map { String(format: " (after %d changes over %.1fs)", burstEvents, lastChange.timeIntervalSince($0)) } ?? ""
     burstStart = nil; burstEvents = 0
-    guard let d = findTarget(watchTarget), d.serial != watchSerial else { return }
+    guard let d = findTarget(watchTarget) else { return }
+    guard d.serial != watchSerial else { reorder(burst); return }
     recentApplies = recentApplies.filter { Date().timeIntervalSince($0) < 120 }
     guard recentApplies.count < 3 else { log("skip: applied 3 times in 2 minutes"); return }
     recentApplies.append(Date())
     log("apply \(watchTarget): serial \(d.serial) -> \(watchSerial): \(hex(apply(d, serial: watchSerial)))\(burst)")
     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { verify(retry: true) }
+}
+
+// Runs once the override is in place, so the displays can be told apart. Same limit as applying.
+func reorder(_ burst: String) {
+    guard !watchOrder.isEmpty, let moves = arrangement(watchOrder) else { return }
+    recentArranges = recentArranges.filter { Date().timeIntervalSince($0) < 120 }
+    guard recentArranges.count < 3 else { log("skip: arranged 3 times in 2 minutes"); return }
+    recentArranges.append(Date())
+    log("arrange \(watchOrder.joined(separator: ",")): \(describe(moves)): \(arrange(moves).rawValue)\(burst)")
 }
 
 // If the Dock missed the new display, restore the factory EDID; check() re-applies it after the
@@ -180,6 +234,7 @@ func option(_ name: String) -> String? {
 }
 
 let target = option("--target")
+let order = option("--order")?.split(separator: ",").map(String.init) ?? []
 let serialArg: UInt32? = option("--serial").map {
     guard let n = UInt32($0) else { fail("--serial must be a 32-bit unsigned integer") }
     return n
@@ -196,7 +251,8 @@ case "list":
     CGGetOnlineDisplayList(16, &ids, &n)
     print("macOS serials: \(ids.prefix(Int(n)).map { CGDisplaySerialNumber($0) })")
     for d in externalDisplays() {
-        print("\(d.name ?? "?")  alphanumeric=\(d.alnum ?? "-")  serial=\(d.serial)")
+        let origin = cgDisplay(d).map { CGDisplayBounds($0).origin }.map { "  origin=(\(Int($0.x)),\(Int($0.y)))" } ?? ""
+        print("\(d.name ?? "?")  alphanumeric=\(d.alnum ?? "-")  serial=\(d.serial)\(origin)")
     }
     let missing = displaysWithoutSpaces()
     if !missing.isEmpty { print("displays without Spaces (no wallpaper/menu bar): \(missing.joined(separator: ", "))") }
@@ -212,10 +268,16 @@ case "reset":
     guard let d = findTarget(t) else { fail("display \(t) not found") }
     print("reset \(t): \(hex(IOAVServiceSetVirtualEDIDMode(d.service, nil, nil)))")
 
+case "arrange":
+    guard order.count >= 2 else { fail("--order needs at least two alphanumeric serials\n\n" + usage) }
+    guard let moves = arrangement(order) else { print("nothing to do: already in order, or a display is missing or shares its serial"); exit(0) }
+    print("arrange \(order.joined(separator: ",")): \(describe(moves)): \(arrange(moves).rawValue)")
+
 case "watch":
     watchTarget = requireTarget()
     watchSerial = serialArg ?? derivedSerial(watchTarget)
-    log("watch \(watchTarget) -> serial \(watchSerial)")
+    watchOrder = order
+    log("watch \(watchTarget) -> serial \(watchSerial)" + (order.isEmpty ? "" : ", order \(order.joined(separator: ","))"))
     // A background NSApplication keeps a WindowServer connection whose events deliver the
     // reconfiguration callbacks; a bare run loop does not get them.
     NSApplication.shared.setActivationPolicy(.prohibited)
